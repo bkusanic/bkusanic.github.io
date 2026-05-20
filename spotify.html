@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Playlist Forge</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant:ital,wght@0,500;0,700;1,500&family=Outfit:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{
+      min-height:100vh;font-family:'Outfit',sans-serif;
+      background:linear-gradient(rgba(255,255,255,0.55),rgba(255,255,255,0.55)),
+        url('https://images.unsplash.com/photo-1522748906645-95d8adfd52c7?auto=format&fit=crop&w=1920&q=80') center/cover fixed;
+    }
+    @keyframes spin{to{transform:rotate(360deg)}}
+    @keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+    .fade{animation:fadeIn 0.35s ease both;}
+    ::-webkit-scrollbar{width:6px}
+    ::-webkit-scrollbar-thumb{background:rgba(21,101,192,0.3);border-radius:3px}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useEffect } = React;
+
+const SPOTIFY_ACCOUNTS = "https://accounts.spotify.com";
+const SPOTIFY_API      = "https://api.spotify.com/v1";
+const REDIRECT_URI     = "https://example.com";
+const SCOPES           = "playlist-modify-public playlist-modify-private";
+
+// ── PKCE ──────────────────────────────────────────────────
+function genVerifier(len=128){
+  const chars="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+  return Array.from(crypto.getRandomValues(new Uint8Array(len))).map(x=>chars[x%chars.length]).join("");
+}
+async function genChallenge(v){
+  const digest=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(v));
+  return btoa(String.fromCharCode(...new Uint8Array(digest))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=/g,"");
+}
+function parseCode(url){
+  const m=url.match(/[?&]code=([^&#\s]+)/);
+  return m?m[1]:url.trim();
+}
+
+// ── Spotify API ────────────────────────────────────────────
+async function exchangeToken(code,verifier,clientId){
+  const body=new URLSearchParams({client_id:clientId,grant_type:"authorization_code",code,redirect_uri:REDIRECT_URI,code_verifier:verifier});
+  const res=await fetch(`${SPOTIFY_ACCOUNTS}/api/token`,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body});
+  const text=await res.text();
+  try{return JSON.parse(text);}catch(e){throw new Error(`Token exchange failed (${res.status}): ${text.slice(0,120)}`);}
+}
+async function safeJson(res){
+  const text=await res.text();
+  try{return JSON.parse(text);}catch(e){throw new Error(`Non-JSON (${res.status}): ${text.slice(0,120)}`);}
+}
+async function sGet(path,token){
+  return safeJson(await fetch(`${SPOTIFY_API}${path}`,{headers:{Authorization:`Bearer ${token}`}}));
+}
+async function sPost(path,body,token){
+  return safeJson(await fetch(`${SPOTIFY_API}${path}`,{method:"POST",headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json"},body:JSON.stringify(body)}));
+}
+async function searchTrack(artist,title,token){
+  const q=encodeURIComponent(`artist:${artist} track:${title}`);
+  const d=await sGet(`/search?q=${q}&type=track&limit=1`,token);
+  return d.tracks?.items?.[0]||null;
+}
+
+// ── Groq ───────────────────────────────────────────────────
+function extractSongs(raw){
+  const m=raw.match(/\[[\s\S]*\]/);
+  if(m){try{return JSON.parse(m[0]);}catch(e){}}
+  const songs=[];
+  const re=/\{\s*"artist"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"title"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}/g;
+  let match;
+  while((match=re.exec(raw))!==null) songs.push({artist:match[1],title:match[2]});
+  return songs;
+}
+async function groqCall(apiKey,prompt,angle){
+  const res=await fetch("https://api.groq.com/openai/v1/chat/completions",{
+    method:"POST",headers:{"Content-Type":"application/json","Authorization":`Bearer ${apiKey}`},
+    body:JSON.stringify({model:"llama-3.3-70b-versatile",max_tokens:4000,
+      messages:[{role:"user",content:`Create a playlist of 15 songs for: "${prompt}". ${angle}\nRESPOND WITH ONLY A JSON ARRAY starting with [ ending with ]:\n[{"artist":"Name","title":"Title"},...]`}]
+    })
+  });
+  const d=await res.json();
+  if(d.error)throw new Error("Groq: "+(d.error.message||JSON.stringify(d.error)));
+  return extractSongs(d.choices?.[0]?.message?.content||"");
+}
+async function callGroq(prompt){
+  const apiKey=localStorage.getItem("groq_key")||"";
+  if(!apiKey)throw new Error("No Groq API key — go back to Setup.");
+  const angles=[
+    "Focus on the most iconic, well-known tracks that define this mood.",
+    "Focus on hidden gems and deeper cuts that true fans would appreciate.",
+    "Focus on artists similar to the obvious choices but less mainstream.",
+    "Focus on eclectic, unexpected songs that still perfectly fit the vibe.",
+  ];
+  const results=await Promise.all(angles.map(a=>groqCall(apiKey,prompt,a).catch(()=>[])));
+  const seen=new Set();
+  return results.flat().filter(s=>{
+    const key=(s.artist+s.title).toLowerCase().replace(/\s/g,"");
+    if(seen.has(key))return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+// ── Design ─────────────────────────────────────────────────
+const C={
+  blue:"#1565C0",blueDark:"#0d3b7a",blueLight:"#e3f2fd",
+  green:"#2E7D32",greenLight:"#e8f5e9",
+  yellow:"#F9A825",
+  text:"#1a237e",textDark:"#0d1b4b",muted:"#546e7a",
+  success:"#2E7D32",miss:"#90a4ae",error:"#c62828",
+  card:"rgba(255,255,255,0.88)",cardBorder:"rgba(255,255,255,0.7)",
+  spotify:"#1DB954",
+};
+
+function Inp({value,onChange,placeholder,multiline,mono}){
+  const s={background:"rgba(255,255,255,0.9)",border:"2px solid rgba(21,101,192,0.2)",borderRadius:10,
+    color:C.textDark,fontFamily:mono?"'DM Mono',monospace":"'Outfit',sans-serif",
+    fontSize:mono?13:15,padding:"12px 16px",width:"100%",boxSizing:"border-box",outline:"none",transition:"border-color 0.2s"};
+  const on=e=>e.target.style.borderColor=C.blue, off=e=>e.target.style.borderColor="rgba(21,101,192,0.2)";
+  return multiline
+    ?<textarea value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder} rows={4} style={{...s,resize:"vertical",lineHeight:1.6}} onFocus={on} onBlur={off}/>
+    :<input value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder} style={s} onFocus={on} onBlur={off}/>;
+}
+function Btn({children,onClick,disabled,outline,color,small,style={}}){
+  const [h,setH]=useState(false);
+  const cols={yellow:{bg:h&&!disabled?"#f0a500":C.yellow,text:"#1a237e"},blue:{bg:h&&!disabled?"#0d3b7a":C.blue,text:"#fff"},green:{bg:h&&!disabled?"#1b5e20":C.green,text:"#fff"},spotify:{bg:h&&!disabled?"#17a349":C.spotify,text:"#fff"},red:{bg:h&&!disabled?"#b71c1c":C.error,text:"#fff"}};
+  const s=cols[color||"yellow"];
+  return <button onClick={onClick} disabled={disabled} onMouseEnter={()=>setH(true)} onMouseLeave={()=>setH(false)}
+    style={{background:outline?"transparent":disabled?"#ccc":s.bg,border:outline?`2px solid ${C.blue}`:"none",color:outline?C.blue:disabled?"#888":s.text,
+      fontFamily:"'Outfit',sans-serif",fontWeight:600,fontSize:small?13:15,padding:small?"9px 16px":"13px 24px",borderRadius:10,
+      cursor:disabled?"not-allowed":"pointer",opacity:disabled?0.6:1,transition:"all 0.18s",letterSpacing:"0.02em",
+      boxShadow:disabled?"none":"0 2px 8px rgba(0,0,0,0.15)",...style}}>{children}</button>;
+}
+function Lbl({children,color}){
+  return <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:color||C.blue,marginBottom:8}}>{children}</div>;
+}
+function Card({children,style={}}){
+  return <div className="fade" style={{background:C.card,backdropFilter:"blur(12px)",border:`1px solid ${C.cardBorder}`,borderRadius:16,padding:"22px 26px",boxShadow:"0 4px 24px rgba(21,101,192,0.1)",...style}}>{children}</div>;
+}
+function NumList({items}){
+  return <div style={{display:"flex",flexDirection:"column",gap:14}}>
+    {items.map((item,i)=>(
+      <div key={i} style={{display:"flex",gap:12,alignItems:"flex-start"}}>
+        <div style={{width:26,height:26,borderRadius:"50%",background:C.blue,display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:700,color:"#fff",flexShrink:0,marginTop:1}}>{i+1}</div>
+        <div style={{fontSize:14,color:C.textDark,lineHeight:1.65}}>{item}</div>
+      </div>
+    ))}
+  </div>;
+}
+const ALL_STEPS=["setup","auth","prompt","searching","preview","result"];
+function Dots({current}){
+  const i=ALL_STEPS.indexOf(current);
+  const dotColors=[C.blue,C.green,C.yellow,C.blue,C.green,C.blue];
+  return <div style={{display:"flex",gap:7,alignItems:"center"}}>
+    {ALL_STEPS.slice(0,5).map((_,j)=>(
+      <div key={j} style={{width:j===i?22:7,height:7,borderRadius:4,background:j<=i?dotColors[j]:"rgba(0,0,0,0.15)",transition:"all 0.3s"}}/>
+    ))}
+  </div>;
+}
+function Shell({step,children,onReset}){
+  return <div style={{minHeight:"100vh",position:"relative"}}>
+    <div style={{position:"relative",zIndex:1,maxWidth:580,margin:"0 auto",padding:"28px 18px 80px"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:40}}>
+        <div>
+          <div style={{fontFamily:"'Cormorant',serif",fontSize:26,fontWeight:700,letterSpacing:"0.03em",background:`linear-gradient(135deg,${C.blue},${C.green})`,WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>PLAYLIST FORGE</div>
+          <div style={{fontSize:10,color:C.muted,letterSpacing:"0.1em",fontWeight:600}}>POWERED BY SPOTIFY + GROQ AI</div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:14}}>
+          <Dots current={step}/>
+          {step!=="setup"&&<button onClick={onReset} style={{background:"rgba(255,255,255,0.8)",border:`1px solid ${C.blue}`,borderRadius:8,color:C.blue,fontSize:12,cursor:"pointer",fontFamily:"'Outfit',sans-serif",padding:"5px 10px",fontWeight:600}}>↺ restart</button>}
+        </div>
+      </div>
+      {children}
+      <div style={{marginTop:48,textAlign:"center",fontSize:12,color:C.muted,lineHeight:1.8}}>
+        Built in collaboration by{" "}
+        <a href="https://www.linkedin.com/in/branimir-ku%C5%A1ani%C4%87-3164bb15/" target="_blank" rel="noreferrer" style={{color:C.blue,fontWeight:600,textDecoration:"none",borderBottom:`1px solid ${C.blue}`}}>Branimir Kušanić</a>{" "}& Claude (Anthropic)
+      </div>
+    </div>
+  </div>;
+}
+
+// ══════════════════════════════════════════════════════════
+// STEP 1 — Setup
+// ══════════════════════════════════════════════════════════
+function StepSetup({onNext}){
+  const [clientId,setClientId]=useState(localStorage.getItem("sp_client_id")||"");
+  const [groqKey,setGroqKey]=useState(localStorage.getItem("groq_key")||"");
+  const go=()=>{localStorage.setItem("sp_client_id",clientId.trim());localStorage.setItem("groq_key",groqKey.trim());onNext(clientId.trim());};
+  return <div>
+    <h1 style={{fontFamily:"'Cormorant',serif",fontSize:42,fontWeight:700,margin:"0 0 10px",lineHeight:1.1,color:C.textDark}}>Connect<br/><em style={{color:C.blue}}>Spotify</em></h1>
+    <p style={{color:C.muted,fontSize:15,marginBottom:28,lineHeight:1.6}}>Create a free Spotify Developer app to let this tool generate playlists on your account.</p>
+    <Card style={{marginBottom:20}}>
+      <Lbl color={C.blue}>Spotify · one-time setup (~3 min)</Lbl>
+      <NumList items={[
+        <span>Go to <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noreferrer" style={{color:C.blue,fontWeight:600,textDecoration:"none",borderBottom:`1px solid ${C.blue}`}}>developer.spotify.com/dashboard</a> and log in</span>,
+        <span>Tap <b>"Create app"</b> — fill in any name &amp; description</span>,
+        <span>Set <b>Redirect URI</b> to: <span style={{fontFamily:"'DM Mono',monospace",background:C.blueLight,color:C.blue,padding:"3px 8px",borderRadius:5,fontSize:13}}>https://example.com</span> — tap <b>Add</b>, then <b>Save</b></span>,
+        <span>Under <b>"APIs used"</b> check <b>Web API</b> ✓ (if greyed out, fill name &amp; redirect URI first)</span>,
+        <span>Copy your <b>Client ID</b> from the top of the app page</span>,
+      ]}/>
+    </Card>
+    <Card style={{marginBottom:24}}>
+      <Lbl color={C.green}>Groq AI · free API key</Lbl>
+      <NumList items={[
+        <span>Go to <a href="https://console.groq.com" target="_blank" rel="noreferrer" style={{color:C.green,fontWeight:600,textDecoration:"none",borderBottom:`1px solid ${C.green}`}}>console.groq.com</a> — sign up free, no credit card needed</span>,
+        <span>Go to <b>API Keys</b> → <b>Create API Key</b> and copy it</span>,
+      ]}/>
+    </Card>
+    <div style={{marginBottom:16}}><Lbl>Spotify Client ID</Lbl><Inp value={clientId} onChange={setClientId} placeholder="Paste your 32-character Client ID" mono/></div>
+    <div style={{marginBottom:8}}><Lbl color={C.green}>Groq API Key</Lbl><Inp value={groqKey} onChange={setGroqKey} placeholder="gsk_..." mono/></div>
+    <div style={{marginBottom:24,fontSize:12,color:C.muted}}>Both keys are stored only in your browser — never sent anywhere except directly to Spotify and Groq.</div>
+    <Btn onClick={go} disabled={clientId.trim().length<10||groqKey.trim().length<10} color="blue">Continue →</Btn>
+  </div>;
+}
+
+// ══════════════════════════════════════════════════════════
+// STEP 2 — Auth
+// ══════════════════════════════════════════════════════════
+function StepAuth({clientId,onSuccess}){
+  const [authUrl,setAuthUrl]=useState(localStorage.getItem("sp_auth_url")||"");
+  const [codeInput,setCodeInput]=useState("");
+  const [error,setError]=useState("");
+  const [verifying,setVerifying]=useState(false);
+  const linkReady=!!authUrl;
+
+  const generateLink=async()=>{
+    const verifier=genVerifier(), challenge=await genChallenge(verifier);
+    const id=clientId||localStorage.getItem("sp_client_id")||"";
+    const params=new URLSearchParams({client_id:id,response_type:"code",redirect_uri:REDIRECT_URI,code_challenge_method:"S256",code_challenge:challenge,scope:SCOPES,show_dialog:"true"});
+    const url=`${SPOTIFY_ACCOUNTS}/authorize?${params}`;
+    localStorage.setItem("sp_verifier",verifier);localStorage.setItem("sp_client_id",id);localStorage.setItem("sp_auth_url",url);
+    setAuthUrl(url);
+  };
+
+  const handleVerify=async()=>{
+    setError("");setVerifying(true);
+    const code=parseCode(codeInput), verifier=localStorage.getItem("sp_verifier"), id=localStorage.getItem("sp_client_id")||clientId;
+    if(!code||code.length<10){setError("Paste the full URL from the address bar — must contain '?code='");setVerifying(false);return;}
+    if(!verifier){setError("Session expired — generate a new login link.");setVerifying(false);return;}
+    if(!localStorage.getItem("groq_key")){setError("No Groq key found — go back to Step 1.");setVerifying(false);return;}
+    try{
+      const tok=await exchangeToken(code,verifier,id);
+      if(tok.error)throw new Error(tok.error_description||tok.error);
+      const user=await sGet("/me",tok.access_token);
+      if(user.error)throw new Error(user.error.message);
+      ["sp_verifier","sp_auth_url"].forEach(k=>localStorage.removeItem(k));
+      onSuccess(tok.access_token,user.id);
+    }catch(e){setError("Failed: "+e.message);setVerifying(false);}
+  };
+
+  return <div>
+    <h1 style={{fontFamily:"'Cormorant',serif",fontSize:42,fontWeight:700,margin:"0 0 10px",lineHeight:1.1,color:C.textDark}}>Log in to<br/><em style={{color:C.blue}}>Spotify</em></h1>
+    <p style={{color:C.muted,fontSize:15,marginBottom:26,lineHeight:1.6}}>Follow these 3 steps to connect your account.</p>
+    <div style={{marginBottom:14,padding:"12px 16px",background:C.greenLight,borderRadius:10,border:`1px solid rgba(46,125,50,0.2)`,fontSize:13,color:C.green,fontWeight:500}}>✓ Groq API key saved from Step 1</div>
+    <Card style={{marginBottom:14}}>
+      <Lbl color={C.blue}>Step 1 — Generate your login link</Lbl>
+      <Btn onClick={generateLink} color="blue">{linkReady?"Regenerate Link":"Generate Login Link"}</Btn>
+      {linkReady&&<div style={{marginTop:12,padding:"10px 14px",background:C.greenLight,borderRadius:8,border:`1px solid ${C.green}`,color:C.green,fontSize:13,fontWeight:600}}>✓ Link ready — continue below</div>}
+    </Card>
+    {linkReady&&<>
+      <Card style={{marginBottom:14}}>
+        <Lbl color={C.blue}>Step 2 — Open Spotify &amp; approve</Lbl>
+        <a href={authUrl} target="_blank" rel="noreferrer" style={{display:"block",textDecoration:"none"}}>
+          <div style={{background:C.spotify,color:"#fff",fontFamily:"'Outfit',sans-serif",fontWeight:700,fontSize:16,padding:"15px",borderRadius:10,textAlign:"center",boxShadow:"0 2px 12px rgba(29,185,84,0.4)"}}>Open Spotify Login →</div>
+        </a>
+        <div style={{marginTop:10,fontSize:13,color:C.muted,lineHeight:1.6}}>Log in and tap <b style={{color:C.textDark}}>Agree</b>. You'll land on a plain white "Example Domain" page — that's correct.</div>
+      </Card>
+      <Card style={{marginBottom:14}}>
+        <Lbl color={C.blue}>Step 3 — Copy URL &amp; paste here</Lbl>
+        <div style={{fontSize:13,color:C.muted,marginBottom:10,lineHeight:1.6}}>Copy the full URL from the address bar:<br/><span style={{fontFamily:"'DM Mono',monospace",fontSize:12,background:C.blueLight,padding:"5px 8px",borderRadius:5,display:"inline-block",marginTop:4}}>https://example.com/?code=AQ...</span></div>
+        <Inp value={codeInput} onChange={setCodeInput} placeholder="https://example.com/?code=..." mono/>
+        {error&&<div style={{marginTop:12,color:C.error,fontSize:13,padding:"10px 14px",background:"#fff5f5",borderRadius:8,border:`1px solid ${C.error}`}}>{error}</div>}
+        <div style={{marginTop:14}}><Btn onClick={handleVerify} disabled={!codeInput.trim()||verifying} color="blue">{verifying?"Verifying…":"Verify & Continue →"}</Btn></div>
+      </Card>
+    </>}
+  </div>;
+}
+
+// ══════════════════════════════════════════════════════════
+// STEP 3 — Prompt
+// ══════════════════════════════════════════════════════════
+function StepPrompt({onGenerate}){
+  const [prompt,setPrompt]=useState("");
+  const [name,setName]=useState("");
+  const examples=["Late night drive, melancholic and cinematic","Sunday morning coffee, jazz and acoustic","80s movie training montage energy","Slavonian tambura music, lively bećarac and kolo, po šokački","Bosnian/Balkan classics, nostalgic and emotional","Intellectually curious, beauty in patterns, Bach to Radiohead"];
+  return <div>
+    <h1 style={{fontFamily:"'Cormorant',serif",fontSize:42,fontWeight:700,margin:"0 0 10px",lineHeight:1.1,color:C.textDark}}>Describe your<br/><em style={{color:C.blue}}>playlist</em></h1>
+    <p style={{color:C.muted,fontSize:15,marginBottom:28,lineHeight:1.6}}>Write a mood, moment, or vibe. AI searches Spotify and lets you review results before creating the playlist.</p>
+    <Card style={{marginBottom:18}}>
+      <div style={{marginBottom:18}}><Lbl>What's the vibe?</Lbl><Inp value={prompt} onChange={setPrompt} placeholder="e.g. Rainy evening in Zagreb, nostalgic and slow…" multiline/></div>
+      <div><Lbl>Playlist name (optional)</Lbl><Inp value={name} onChange={setName} placeholder="Leave blank to auto-generate"/></div>
+    </Card>
+    <div style={{marginBottom:30}}>
+      <div style={{fontSize:11,color:C.muted,letterSpacing:"0.08em",fontWeight:600,marginBottom:10}}>EXAMPLES — TAP TO USE</div>
+      <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+        {examples.map(ex=>(
+          <button key={ex} onClick={()=>setPrompt(ex)} style={{background:"rgba(255,255,255,0.85)",border:"1.5px solid rgba(21,101,192,0.25)",borderRadius:20,color:C.blue,fontSize:13,padding:"7px 14px",cursor:"pointer",fontFamily:"'Outfit',sans-serif",fontWeight:500,transition:"all 0.15s"}}
+            onMouseEnter={e=>{e.target.style.background=C.blueLight;e.target.style.borderColor=C.blue;}}
+            onMouseLeave={e=>{e.target.style.background="rgba(255,255,255,0.85)";e.target.style.borderColor="rgba(21,101,192,0.25)";}}>
+            {ex}
+          </button>
+        ))}
+      </div>
+    </div>
+    <Btn onClick={()=>onGenerate(prompt,name)} disabled={!prompt.trim()} color="yellow">Search Spotify →</Btn>
+  </div>;
+}
+
+// ══════════════════════════════════════════════════════════
+// STEP 4 — Searching (AI + Spotify search with live log)
+// ══════════════════════════════════════════════════════════
+function StepSearching({logs}){
+  const ref=useRef(null);
+  useEffect(()=>{if(ref.current)ref.current.scrollTop=ref.current.scrollHeight;},[logs]);
+  const col=t=>({success:C.success,miss:C.miss,error:C.error,busy:C.blue}[t]||C.textDark);
+  const icon=t=>({success:"✓",miss:"–",error:"✗",busy:"⟳"}[t]||" ");
+  return <div>
+    <h1 style={{fontFamily:"'Cormorant',serif",fontSize:42,fontWeight:700,margin:"0 0 10px",lineHeight:1.1,color:C.textDark}}>Searching<br/><em style={{color:C.blue}}>Spotify…</em></h1>
+    <p style={{color:C.muted,fontSize:15,marginBottom:28}}>AI is suggesting songs and checking which ones exist on Spotify. About 20–40 seconds.</p>
+    <div style={{display:"flex",justifyContent:"center",marginBottom:26}}>
+      <svg width="80" height="80" viewBox="0 0 80 80" style={{animation:"spin 3s linear infinite"}}>
+        {[34,27,20,13,7].map((r,i)=><circle key={r} cx="40" cy="40" r={r} fill="none" stroke={[C.blue,C.green,C.yellow,C.blue,C.green][i]} strokeWidth="1.5" opacity="0.5"/>)}
+        <circle cx="40" cy="40" r="5" fill={C.blue} opacity="0.9"/>
+        <circle cx="40" cy="40" r="2" fill="white"/>
+      </svg>
+    </div>
+    <Card>
+      <div ref={ref} style={{fontFamily:"'DM Mono',monospace",fontSize:13,lineHeight:1.85,maxHeight:300,overflowY:"auto"}}>
+        {logs.length===0?<span style={{color:C.muted}}>Starting…</span>:logs.map(l=><div key={l.id} style={{color:col(l.t)}}>{icon(l.t)} {l.m}</div>)}
+      </div>
+    </Card>
+  </div>;
+}
+
+// ══════════════════════════════════════════════════════════
+// STEP 5 — Preview & select tracks
+// ══════════════════════════════════════════════════════════
+function StepPreview({found,notFound,playlistName,onConfirm,onBack}){
+  const [selected,setSelected]=useState(()=>new Set(found.map(t=>t.id)));
+  const [creating,setCreating]=useState(false);
+  const [plName,setPlName]=useState(playlistName);
+
+  const toggle=id=>setSelected(prev=>{const n=new Set(prev);n.has(id)?n.delete(id):n.add(id);return n;});
+  const selectAll=()=>setSelected(new Set(found.map(t=>t.id)));
+  const selectNone=()=>setSelected(new Set());
+
+  const selectedTracks=found.filter(t=>selected.has(t.id));
+
+  return <div>
+    <h1 style={{fontFamily:"'Cormorant',serif",fontSize:42,fontWeight:700,margin:"0 0 10px",lineHeight:1.1,color:C.textDark}}>Review your<br/><em style={{color:C.blue}}>tracks</em></h1>
+    <p style={{color:C.muted,fontSize:15,marginBottom:20,lineHeight:1.6}}>
+      Found <b style={{color:C.green}}>{found.length}</b> tracks on Spotify
+      {notFound.length>0&&<span>, <b style={{color:C.muted}}>{notFound.length}</b> not available</span>}.
+      Tick or untick before creating your playlist.
+    </p>
+
+    {/* Playlist name */}
+    <Card style={{marginBottom:16}}>
+      <Lbl>Playlist name</Lbl>
+      <Inp value={plName} onChange={setPlName} placeholder="My playlist"/>
+    </Card>
+
+    {/* Select controls */}
+    <div style={{display:"flex",gap:8,marginBottom:14,alignItems:"center"}}>
+      <Btn small color="blue" onClick={selectAll}>Select all</Btn>
+      <Btn small outline onClick={selectNone}>Deselect all</Btn>
+      <span style={{marginLeft:"auto",fontSize:13,color:C.muted,fontWeight:600}}>{selected.size} selected</span>
+    </div>
+
+    {/* Found tracks */}
+    <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:found.length>0&&notFound.length>0?20:0}}>
+      {found.map(t=>(
+        <div key={t.id} onClick={()=>toggle(t.id)}
+          style={{display:"flex",alignItems:"center",gap:12,background:selected.has(t.id)?"rgba(255,255,255,0.92)":"rgba(255,255,255,0.5)",borderRadius:10,padding:"10px 14px",border:`1.5px solid ${selected.has(t.id)?C.blue:"rgba(21,101,192,0.15)"}`,cursor:"pointer",transition:"all 0.15s",boxShadow:selected.has(t.id)?"0 2px 8px rgba(21,101,192,0.1)":"none"}}>
+          {/* Checkbox */}
+          <div style={{width:20,height:20,borderRadius:5,border:`2px solid ${selected.has(t.id)?C.blue:"#ccc"}`,background:selected.has(t.id)?C.blue:"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,transition:"all 0.15s"}}>
+            {selected.has(t.id)&&<span style={{color:"#fff",fontSize:13,fontWeight:700,lineHeight:1}}>✓</span>}
+          </div>
+          {t.album?.images?.[2]?.url&&<img src={t.album.images[2].url} alt="" style={{width:36,height:36,borderRadius:5,objectFit:"cover",flexShrink:0,opacity:selected.has(t.id)?1:0.4}}/>}
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{fontSize:14,fontWeight:600,color:selected.has(t.id)?C.textDark:C.muted,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{t.name}</div>
+            <div style={{fontSize:12,color:C.muted,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{t.artists?.map(a=>a.name).join(", ")}</div>
+          </div>
+          <div style={{fontSize:11,color:C.muted,fontFamily:"'DM Mono',monospace",flexShrink:0}}>{Math.floor(t.duration_ms/60000)}:{String(Math.floor((t.duration_ms%60000)/1000)).padStart(2,"0")}</div>
+        </div>
+      ))}
+    </div>
+
+    {/* Not found tracks */}
+    {notFound.length>0&&(
+      <div style={{marginBottom:24}}>
+        <div style={{fontSize:11,color:C.muted,letterSpacing:"0.08em",fontWeight:600,marginBottom:10}}>NOT AVAILABLE ON SPOTIFY ({notFound.length})</div>
+        <div style={{display:"flex",flexDirection:"column",gap:4}}>
+          {notFound.map((s,i)=>(
+            <div key={i} style={{display:"flex",alignItems:"center",gap:10,padding:"8px 14px",borderRadius:8,background:"rgba(255,255,255,0.4)",border:"1px solid rgba(0,0,0,0.07)"}}>
+              <span style={{color:C.miss,fontSize:13}}>✗</span>
+              <div style={{fontSize:13,color:C.miss}}><b>{s.artist}</b> — {s.title}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    )}
+
+    {/* Actions */}
+    <div style={{display:"flex",gap:10,flexWrap:"wrap",marginTop:8}}>
+      <Btn color="yellow" disabled={selected.size===0||creating} onClick={()=>onConfirm(selectedTracks,plName)}>
+        {creating?"Creating…":`Create playlist with ${selected.size} tracks →`}
+      </Btn>
+      <Btn outline onClick={onBack}>← Back to prompt</Btn>
+    </div>
+  </div>;
+}
+
+// ══════════════════════════════════════════════════════════
+// STEP 6 — Result
+// ══════════════════════════════════════════════════════════
+function StepResult({tracks,playlistId,onReset}){
+  return <div>
+    <h1 style={{fontFamily:"'Cormorant',serif",fontSize:42,fontWeight:700,margin:"0 0 10px",lineHeight:1.1,color:C.textDark}}>Done! <em style={{color:C.green}}>✦</em></h1>
+    <p style={{color:C.muted,fontSize:15,marginBottom:24,lineHeight:1.6}}>{tracks.length} tracks added to your Spotify.</p>
+    <div style={{display:"flex",gap:10,marginBottom:32,flexWrap:"wrap"}}>
+      <Btn color="spotify" onClick={()=>window.open(`https://open.spotify.com/playlist/${playlistId}`,"_blank")}>Open in Spotify →</Btn>
+      <Btn outline onClick={onReset}>New playlist</Btn>
+    </div>
+    <div style={{fontSize:11,color:C.muted,letterSpacing:"0.08em",fontWeight:600,marginBottom:12}}>TRACKS IN YOUR PLAYLIST</div>
+    <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:36}}>
+      {tracks.map((t,i)=>(
+        <div key={t.id} style={{display:"flex",alignItems:"center",gap:12,background:"rgba(255,255,255,0.85)",backdropFilter:"blur(8px)",borderRadius:10,padding:"10px 14px",border:"1px solid rgba(255,255,255,0.7)",boxShadow:"0 2px 8px rgba(21,101,192,0.06)"}}>
+          <div style={{fontSize:11,color:C.muted,fontFamily:"'DM Mono',monospace",width:22,textAlign:"right",flexShrink:0}}>{String(i+1).padStart(2,"0")}</div>
+          {t.album?.images?.[2]?.url&&<img src={t.album.images[2].url} alt="" style={{width:36,height:36,borderRadius:6,objectFit:"cover",flexShrink:0,boxShadow:"0 2px 6px rgba(0,0,0,0.15)"}}/>}
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{fontSize:14,fontWeight:600,color:C.textDark,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{t.name}</div>
+            <div style={{fontSize:12,color:C.muted,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{t.artists?.map(a=>a.name).join(", ")}</div>
+          </div>
+          <div style={{fontSize:11,color:C.muted,fontFamily:"'DM Mono',monospace",flexShrink:0}}>{Math.floor(t.duration_ms/60000)}:{String(Math.floor((t.duration_ms%60000)/1000)).padStart(2,"0")}</div>
+        </div>
+      ))}
+    </div>
+  </div>;
+}
+
+// ══════════════════════════════════════════════════════════
+// ROOT
+// ══════════════════════════════════════════════════════════
+function App(){
+  const [step,setStep]=useState("setup");
+  const [clientId,setClientId]=useState("");
+  const [accessToken,setAccessToken]=useState("");
+  const [logs,setLogs]=useState([]);
+  const [foundTracks,setFoundTracks]=useState([]);
+  const [notFoundSongs,setNotFoundSongs]=useState([]);
+  const [pendingName,setPendingName]=useState("");
+  const [finalTracks,setFinalTracks]=useState([]);
+  const [playlistId,setPlaylistId]=useState(null);
+
+  useEffect(()=>{
+    const id=localStorage.getItem("sp_client_id"), v=localStorage.getItem("sp_verifier");
+    if(id)setClientId(id);
+    if(id&&v)setStep("auth");
+  },[]);
+
+  const log=(m,t="info")=>setLogs(p=>[...p,{m,t,id:Math.random()}]);
+
+  const handleReset=()=>{
+    ["sp_verifier","sp_auth_url","sp_client_id","groq_key"].forEach(k=>localStorage.removeItem(k));
+    setStep("setup");setClientId("");setAccessToken("");setLogs([]);
+    setFoundTracks([]);setNotFoundSongs([]);setFinalTracks([]);setPlaylistId(null);
+  };
+
+  // Search phase: AI + Spotify search → preview
+  const handleSearch=async(prompt,name)=>{
+    setStep("searching");setLogs([]);setFoundTracks([]);setNotFoundSongs([]);setPendingName(name||`✦ ${prompt.slice(0,45)}${prompt.length>45?"…":""}`);
+    try{
+      log("Asking Groq AI for songs (4 parallel calls)…","busy");
+      const songs=await callGroq(prompt);
+      log(`Got ${songs.length} unique suggestions`,"success");
+      log("Searching Spotify catalog…","busy");
+      const found=[], notFound=[];
+      for(const s of songs){
+        const track=await searchTrack(s.artist,s.title,accessToken);
+        if(track){found.push(track);log(`${track.artists[0].name} — ${track.name}`,"success");}
+        else{notFound.push(s);log(`Not on Spotify: ${s.artist} — ${s.title}`,"miss");}
+        await new Promise(r=>setTimeout(r,80));
+      }
+      setFoundTracks(found);setNotFoundSongs(notFound);
+      log(`Done! Found ${found.length} tracks. Review and confirm below.`,"success");
+      setStep("preview");
+    }catch(e){log(`Error: ${e.message}`,"error");}
+  };
+
+  // Confirm phase: create playlist with selected tracks
+  const handleConfirm=async(selectedTracks,plName)=>{
+    try{
+      const name=plName.trim()||pendingName;
+      const pl=await sPost("/me/playlists",{name,public:true,description:"Generated by Playlist Forge"},accessToken);
+      if(pl.error)throw new Error(pl.error.message);
+      const uris=selectedTracks.map(t=>t.uri);
+      for(let i=0;i<uris.length;i+=100){
+        const batch=uris.slice(i,i+100);
+        const addUrl=`https://api.spotify.com/v1/playlists/${pl.id}/items?uris=${batch.join(",")}`;
+        const addRes=await fetch(addUrl,{method:"POST",headers:{Authorization:`Bearer ${accessToken}`}});
+        const addJson=await addRes.json().catch(()=>({error:{status:addRes.status,message:"non-JSON"}}));
+        if(addJson.error)throw new Error(`Add failed: ${addJson.error.message} (${addJson.error.status})`);
+      }
+      setFinalTracks(selectedTracks);setPlaylistId(pl.id);setStep("result");
+    }catch(e){alert("Error creating playlist: "+e.message);}
+  };
+
+  return <Shell step={step} onReset={handleReset}>
+    {step==="setup"   && <StepSetup onNext={id=>{setClientId(id);setStep("auth");}}/>}
+    {step==="auth"    && <StepAuth clientId={clientId} onSuccess={(tok)=>{setAccessToken(tok);setStep("prompt");}}/>}
+    {step==="prompt"  && <StepPrompt onGenerate={handleSearch}/>}
+    {step==="searching"&&<StepSearching logs={logs}/>}
+    {step==="preview" && <StepPreview found={foundTracks} notFound={notFoundSongs} playlistName={pendingName} onConfirm={handleConfirm} onBack={()=>setStep("prompt")}/>}
+    {step==="result"  && <StepResult tracks={finalTracks} playlistId={playlistId} onReset={()=>setStep("prompt")}/>}
+  </Shell>;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
