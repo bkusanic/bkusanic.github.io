@@ -123,7 +123,7 @@ async function buildSpotifyPool(queries,token,onProgress){
       // Try both encoded and raw query
       let tracks=[];
       for(const q2 of [encodeURIComponent(q), q.replace(/ /g,"+")]){
-        const d=await sGet(`/search?q=${q2}&type=track&limit=50`,token);
+        const d=await sGet(`/search?q=${q2}&type=track&limit=20`,token);
         if(d.error){
           if(d.error.status===401) throw new Error("SPOTIFY_TOKEN_EXPIRED");
           onProgress(`ERROR "${q}": ${d.error.status} ${d.error.message}`,0);
