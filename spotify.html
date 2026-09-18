@@ -98,13 +98,18 @@ function parseJsonArray(raw){
 }
 async function extractSearchQueries(prompt,apiKey){
   const raw=await groqRaw(apiKey,
-    `You are a music search expert. Generate 8 short Spotify search queries for this playlist description.
+    `You are a music search expert. Generate 10 Spotify search queries for this playlist description.
 Description: "${prompt}"
-Rules: each query 1-4 words, directly searchable on Spotify, mix genre/mood/artist/era terms.
-For regional/folk music include local genre names in original language.
-Return ONLY a JSON array: ["query1","query2",...]`
+
+CRITICAL RULES:
+- Use ONLY artist names or genre names as queries — nothing else
+- Good examples: "Drake", "PARTYNEXTDOOR", "Don Toliver", "R&B", "trap soul", "Weeknd"
+- BAD examples: "Drake hits", "Drake 2022", "Drake mixtape" — NEVER add words after an artist name
+- If the description mentions specific artists, each artist name alone is one query
+- Add 3-4 genre/mood terms that fit the vibe
+- Return ONLY a JSON array of strings: ["Drake","PARTYNEXTDOOR","Don Toliver","R&B","trap","melanin","...]`
   );
-  return parseJsonArray(raw).slice(0,8);
+  return parseJsonArray(raw).slice(0,10);
 }
 async function buildSpotifyPool(queries,token,onProgress){
   const results=await Promise.all(queries.map(async q=>{
