@@ -94,71 +94,51 @@ async function groqRaw(apiKey,message,maxTokens=2000){
       return text;
     }catch(e){lastError=`${model}: ${e.message}`;continue;}
   }
-  throw new Error("Niti jedan Groq model nije dostupan. Provjeri API ključ na console.groq.com. Greška: "+lastError);
+  throw new Error("Groq nije dostupan. Provjeri API ključ na console.groq.com. Greška: "+lastError);
 }
-function parseJsonArray(raw){
-  const m=raw.match(/\[[\s\S]*?\]/);
+function extractSongs(raw){
+  const m=raw.match(/\[[\s\S]*\]/);
   if(m)try{return JSON.parse(m[0]);}catch(e){}
-  throw new Error("Could not parse response: "+raw.slice(0,80));
+  const songs=[];
+  const re=/\{\s*"artist"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"title"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}/g;
+  let match;
+  while((match=re.exec(raw))!==null)songs.push({artist:match[1],title:match[2]});
+  return songs;
 }
-async function extractSearchQueries(prompt,apiKey){
+async function groqCall(apiKey,prompt,angle){
   const raw=await groqRaw(apiKey,
-    `You are a music search expert. Generate 10 Spotify search queries for this playlist description.
-Description: "${prompt}"
-
-CRITICAL RULES:
-- Use ONLY artist names or genre names as queries — nothing else
-- Good examples: "Drake", "PARTYNEXTDOOR", "Don Toliver", "R&B", "trap soul", "Weeknd"
-- BAD examples: "Drake hits", "Drake 2022", "Drake mixtape" — NEVER add words after an artist name
-- If the description mentions specific artists, each artist name alone is one query
-- Add 3-4 genre/mood terms that fit the vibe
-- Return ONLY a JSON array of strings: ["Drake","PARTYNEXTDOOR","Don Toliver","R&B","trap","melanin","...]`
+    `Create a playlist of 10 songs for: "${prompt}". ${angle}
+RESPOND WITH ONLY A JSON ARRAY starting with [ ending with ]:
+[{"artist":"Name","title":"Title"},...]`,
+    2000
   );
-  return parseJsonArray(raw).slice(0,10);
+  return extractSongs(raw);
 }
-async function buildSpotifyPool(queries,token,onProgress){
-  const results=await Promise.all(queries.map(async q=>{
-    try{
-      // Try both encoded and raw query
-      let tracks=[];
-      for(const q2 of [encodeURIComponent(q), q.replace(/ /g,"+")]){
-        const d=await sGet(`/search?q=${q2}&type=track&limit=20`,token);
-        if(d.error){
-          if(d.error.status===401) throw new Error("SPOTIFY_TOKEN_EXPIRED");
-          onProgress(`ERROR "${q}": ${d.error.status} ${d.error.message}`,0);
-          break;
-        }
-        tracks=d.tracks?.items||[];
-        if(tracks.length>0) break; // got results, stop
-      }
-      onProgress(q,tracks.length);
-      return tracks;
-    }catch(e){
-      if(e.message==="SPOTIFY_TOKEN_EXPIRED") throw e;
-      onProgress(`Greška: ${e.message}`,0);
-      return[];
-    }
-  }));
+async function callGroq(prompt){
+  const apiKey=localStorage.getItem("groq_key")||"";
+  if(!apiKey)throw new Error("Nema Groq API ključa — idi na Setup.");
+  const angles=[
+    "Focus on iconic, well-known tracks that define this mood.",
+    "Focus on hidden gems and deeper cuts.",
+    "Focus on less mainstream but fitting artists.",
+  ];
+  const results=await Promise.all(angles.map(a=>groqCall(apiKey,prompt,a).catch(()=>[])));
   const seen=new Set();
-  return results.flat().filter(t=>{
-    if(!t?.id||seen.has(t.id))return false;
-    seen.add(t.id);
+  return results.flat().filter(s=>{
+    const key=(s.artist+s.title).toLowerCase().replace(/\s/g,"");
+    if(seen.has(key))return false;
+    seen.add(key);
     return true;
   });
 }
-async function selectFromPool(pool,prompt,apiKey){
-  const limited=pool.slice(0,150);
-  const compact=limited.map((t,i)=>`${i}|${t.name}|${t.artists[0]?.name||""}`).join("\n");
-  const raw=await groqRaw(apiKey,
-    `Playlist vibe: "${prompt}"
-Available tracks on Spotify (index|name|artist):
-${compact}
-Select up to 30 tracks that BEST match this vibe — mood, style, energy, genre.
-Return ONLY a JSON array of index numbers: [0,5,12,...]`,
-    500
-  );
-  const indices=parseJsonArray(raw);
-  return indices.map(i=>limited[i]).filter(Boolean);
+async function searchSpotifyTrack(artist,title,token){
+  const q=encodeURIComponent(`artist:${artist} track:${title}`);
+  const d=await sGet(`/search?q=${q}&type=track&limit=1`,token);
+  if(d.error){
+    if(d.error.status===401)throw new Error("SPOTIFY_TOKEN_EXPIRED");
+    return null;
+  }
+  return d.tracks?.items?.[0]||null;
 }
 
 // ── Design ─────────────────────────────────────────────────
@@ -379,7 +359,7 @@ function StepSearching({logs}){
   const icon=t=>({success:"✓",miss:"–",error:"✗",busy:"⟳"}[t]||" ");
   return <div>
     <h1 style={{fontFamily:"'Cormorant',serif",fontSize:42,fontWeight:700,margin:"0 0 10px",lineHeight:1.1,color:C.textDark}}>Searching<br/><em style={{color:C.blue}}>Spotify…</em></h1>
-    <p style={{color:C.muted,fontSize:15,marginBottom:28}}>AI extracts search terms → searches Spotify → selects best matches. All results guaranteed on Spotify. About 20–40 seconds.</p>
+    <p style={{color:C.muted,fontSize:15,marginBottom:28}}>AI generira prijedloge → traži na Spotifyu → prikaži preview za potvrdu. Oko 20–40 sekundi.</p>
     <div style={{display:"flex",justifyContent:"center",marginBottom:26}}>
       <svg width="80" height="80" viewBox="0 0 80 80" style={{animation:"spin 3s linear infinite"}}>
         {[34,27,20,13,7].map((r,i)=><circle key={r} cx="40" cy="40" r={r} fill="none" stroke={[C.blue,C.green,C.yellow,C.blue,C.green][i]} strokeWidth="1.5" opacity="0.5"/>)}
@@ -412,8 +392,9 @@ function StepPreview({found,notFound,playlistName,onConfirm,onBack}){
   return <div>
     <h1 style={{fontFamily:"'Cormorant',serif",fontSize:42,fontWeight:700,margin:"0 0 10px",lineHeight:1.1,color:C.textDark}}>Review your<br/><em style={{color:C.blue}}>tracks</em></h1>
     <p style={{color:C.muted,fontSize:15,marginBottom:20,lineHeight:1.6}}>
-      AI selected <b style={{color:C.green}}>{found.length}</b> tracks — all guaranteed available on Spotify.
-      Tick or untick any before creating your playlist.
+      Pronađeno <b style={{color:C.green}}>{found.length}</b> trackova na Spotifyu
+      {notFound.length>0&&<span>, <b style={{color:C.muted}}>{notFound.length}</b> nije dostupno</span>}.
+      Označi ili odznači prije kreiranja playlist.
     </p>
 
     {/* Playlist name */}
@@ -521,38 +502,28 @@ function App(){
     setStep("searching");setLogs([]);setFoundTracks([]);setNotFoundSongs([]);
     setPendingName(name||`✦ ${prompt.slice(0,45)}${prompt.length>45?"…":""}`);
     const apiKey=localStorage.getItem("groq_key")||"";
-    // Use token from state or localStorage fallback
     const token=accessToken||localStorage.getItem("sp_token")||"";
     if(!token){log("Nema Spotify tokena — klikni ↺ restart i ponovi login","error");return;}
     try{
-      // Phase 1: Extract search queries
-      log("AI extracting Spotify search terms…","busy");
-      const queries=await extractSearchQueries(prompt,apiKey);
-      log(`Generated ${queries.length} search queries`,"success");
-      queries.forEach(q=>log(`  → "${q}"`,"info"));
+      log("AI generira prijedloge pjesama (3 paralelna poziva)…","busy");
+      const songs=await callGroq(prompt);
+      log(`Dobiveno ${songs.length} prijedloga`,"success");
 
-      // Phase 2: Search Spotify in parallel
-      log("Searching Spotify catalog (parallel)…","busy");
-      const pool=await buildSpotifyPool(queries,token,(q,count)=>{
-        log(`"${q}" → ${count} tracks`,"success");
-      });
-      if(pool.length===0)throw new Error("No tracks found on Spotify. Try a different description.");
-      log(`Pool: ${pool.length} unique tracks available on Spotify`,"success");
-
-      // Phase 3: AI selects best matches
-      log("AI selecting best tracks from pool…","busy");
-      const selected=await selectFromPool(pool,prompt,apiKey);
-      log(`Selected ${selected.length} tracks — ready to review!`,"success");
-
-      setFoundTracks(selected);
-      setNotFoundSongs([]); // all tracks guaranteed on Spotify
+      log("Tražim na Spotifyu…","busy");
+      const found=[],notFound=[];
+      for(const s of songs){
+        const track=await searchSpotifyTrack(s.artist,s.title,token);
+        if(track){found.push(track);log(`${track.artists[0].name} — ${track.name}`,"success");}
+        else{notFound.push(s);log(`Nije na Spotifyu: ${s.artist} — ${s.title}`,"miss");}
+        await new Promise(r=>setTimeout(r,80));
+      }
+      log(`Gotovo! Pronađeno ${found.length} trackova — provjeri i potvrdi.`,"success");
+      setFoundTracks(found);
+      setNotFoundSongs(notFound);
       setStep("preview");
     }catch(e){
       if(e.message==="SPOTIFY_TOKEN_EXPIRED"){
-        log("⚠️ Spotify token je istekao (vrijedi samo 1 sat)","error");
-        log("→ Klikni ↺ restart gore desno","error");
-        log("→ Na Setup ekranu samo klikni Continue (ključevi su snimljeni)","error");
-        log("→ Generiraj novi login link i ponovi Spotify login","error");
+        log("⚠️ Spotify token je istekao — klikni ↺ restart i ponovi login","error");
       } else {
         log(`Greška: ${e.message}`,"error");
       }
