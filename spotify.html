@@ -66,32 +66,30 @@ async function sPost(path,body,token){
 }
 
 // ── Groq hybrid search ────────────────────────────────────
+// AI via Groq
 const GROQ_MODELS=[
-  "llama-3.3-70b-versatile",
-  "meta-llama/llama-4-scout-17b-16e-instruct",
-  "llama-3.1-8b-instant",
+  "openai/gpt-oss-120b",
+  "openai/gpt-oss-20b",
+  "groq/compound",
+  "groq/compound-mini",
 ];
 async function groqRaw(apiKey,message,maxTokens=2000){
   let lastError="";
   for(const model of GROQ_MODELS){
     try{
       const res=await fetch("https://api.groq.com/openai/v1/chat/completions",{
-        method:"POST",headers:{"Content-Type":"application/json","Authorization":`Bearer ${apiKey}`},
+        method:"POST",
+        headers:{"Content-Type":"application/json","Authorization":`Bearer ${apiKey}`},
         body:JSON.stringify({model,max_tokens:maxTokens,messages:[{role:"user",content:message}]})
       });
       const d=await res.json();
-      if(d.error){
-        // Any model error → try next one
-        lastError=`${model}: ${d.error.message||JSON.stringify(d.error)}`;
-        continue;
-      }
-      return d.choices?.[0]?.message?.content||"";
-    }catch(e){
-      lastError=`${model}: ${e.message}`;
-      continue;
-    }
+      if(d.error){lastError=`${model}: ${d.error.message||JSON.stringify(d.error)}`;continue;}
+      const text=d.choices?.[0]?.message?.content||"";
+      if(!text){lastError=`${model}: empty response`;continue;}
+      return text;
+    }catch(e){lastError=`${model}: ${e.message}`;continue;}
   }
-  throw new Error("No Groq model available. Check your API key at console.groq.com. Last error: "+lastError);
+  throw new Error("Niti jedan Groq model nije dostupan. Provjeri API ključ na console.groq.com. Greška: "+lastError);
 }
 function parseJsonArray(raw){
   const m=raw.match(/\[[\s\S]*?\]/);
