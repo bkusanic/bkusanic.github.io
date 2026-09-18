@@ -66,16 +66,38 @@ async function sPost(path,body,token){
 }
 
 // ── Groq hybrid search ────────────────────────────────────
+const GROQ_MODELS=[
+  "llama-3.3-70b-versatile",
+  "meta-llama/llama-4-scout-17b-16e-instruct",
+  "llama3-70b-8192",
+  "llama-3.1-8b-instant",
+];
 async function groqRaw(apiKey,message,maxTokens=2000){
-  const res=await fetch("https://api.groq.com/openai/v1/chat/completions",{
-    method:"POST",headers:{"Content-Type":"application/json","Authorization":`Bearer ${apiKey}`},
-    body:JSON.stringify({model:"llama-3.3-70b-versatile",max_tokens:maxTokens,
-      messages:[{role:"user",content:message}]
-    })
-  });
-  const d=await res.json();
-  if(d.error)throw new Error("Groq: "+(d.error.message||JSON.stringify(d.error)));
-  return d.choices?.[0]?.message?.content||"";
+  let lastError="";
+  for(const model of GROQ_MODELS){
+    try{
+      const res=await fetch("https://api.groq.com/openai/v1/chat/completions",{
+        method:"POST",headers:{"Content-Type":"application/json","Authorization":`Bearer ${apiKey}`},
+        body:JSON.stringify({model,max_tokens:maxTokens,messages:[{role:"user",content:message}]})
+      });
+      const d=await res.json();
+      if(d.error){
+        // If model not found, try next one
+        if(d.error.code==="model_not_found"||d.error.message?.includes("does not exist")){
+          lastError=`${model} not available`;
+          continue;
+        }
+        throw new Error("Groq: "+(d.error.message||JSON.stringify(d.error)));
+      }
+      return d.choices?.[0]?.message?.content||"";
+    }catch(e){
+      if(e.message?.includes("does not exist")||e.message?.includes("not available")){
+        lastError=e.message; continue;
+      }
+      throw e;
+    }
+  }
+  throw new Error("No Groq model available. Check your API key at console.groq.com. Last error: "+lastError);
 }
 function parseJsonArray(raw){
   const m=raw.match(/\[[\s\S]*?\]/);
@@ -185,7 +207,10 @@ function Shell({step,children,onReset}){
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:40}}>
         <div>
           <div style={{fontFamily:"'Cormorant',serif",fontSize:26,fontWeight:700,letterSpacing:"0.03em",background:`linear-gradient(135deg,${C.blue},${C.green})`,WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>PLAYLIST FORGE</div>
-          <div style={{fontSize:10,color:C.muted,letterSpacing:"0.1em",fontWeight:600}}>POWERED BY SPOTIFY + GROQ AI</div>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <div style={{fontSize:10,color:C.muted,letterSpacing:"0.1em",fontWeight:600}}>POWERED BY SPOTIFY + GROQ AI</div>
+            <div style={{fontSize:12,fontFamily:"'Cormorant',serif",fontStyle:"italic",fontWeight:700,color:C.yellow,letterSpacing:"0.05em",opacity:0.9}}>Micek edition</div>
+          </div>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:14}}>
           <Dots current={step}/>
