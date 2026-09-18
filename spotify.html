@@ -56,7 +56,13 @@ async function exchangeToken(code,verifier,clientId){
 }
 async function safeJson(res){
   const text=await res.text();
-  try{return JSON.parse(text);}catch(e){throw new Error(`Non-JSON (${res.status}): ${text.slice(0,120)}`);}
+  let json;
+  try{json=JSON.parse(text);}catch(e){throw new Error(`Non-JSON (${res.status}): ${text.slice(0,120)}`);}
+  // Detect expired/invalid token explicitly
+  if(res.status===401||json?.error?.status===401){
+    throw new Error("SPOTIFY_TOKEN_EXPIRED");
+  }
+  return json;
 }
 async function sGet(path,token){
   return safeJson(await fetch(`${SPOTIFY_API}${path}`,{headers:{Authorization:`Bearer ${token}`}}));
@@ -114,11 +120,25 @@ CRITICAL RULES:
 async function buildSpotifyPool(queries,token,onProgress){
   const results=await Promise.all(queries.map(async q=>{
     try{
-      const d=await sGet(`/search?q=${encodeURIComponent(q)}&type=track&limit=50`,token);
-      const tracks=d.tracks?.items||[];
+      // Try both encoded and raw query
+      let tracks=[];
+      for(const q2 of [encodeURIComponent(q), q.replace(/ /g,"+")]){
+        const d=await sGet(`/search?q=${q2}&type=track&limit=50`,token);
+        if(d.error){
+          if(d.error.status===401) throw new Error("SPOTIFY_TOKEN_EXPIRED");
+          onProgress(`ERROR "${q}": ${d.error.status} ${d.error.message}`,0);
+          break;
+        }
+        tracks=d.tracks?.items||[];
+        if(tracks.length>0) break; // got results, stop
+      }
       onProgress(q,tracks.length);
       return tracks;
-    }catch(e){onProgress(q,0);return[];}
+    }catch(e){
+      if(e.message==="SPOTIFY_TOKEN_EXPIRED") throw e; // bubble up
+      onProgress(`EXCEPTION on "${q}": ${e.message}`,0);
+      return[];
+    }
   }));
   const seen=new Set();
   return results.flat().filter(t=>{
@@ -525,7 +545,14 @@ function App(){
       setFoundTracks(selected);
       setNotFoundSongs([]); // all tracks guaranteed on Spotify
       setStep("preview");
-    }catch(e){log(`Error: ${e.message}`,"error");}
+    }catch(e){
+      if(e.message==="SPOTIFY_TOKEN_EXPIRED"){
+        log("Spotify token istekao — moraš se re-loginati!","error");
+        log("Klikni ↺ restart → preskoči Setup → generiraj novi login link","error");
+      } else {
+        log(`Error: ${e.message}`,"error");
+      }
+    }
   };
 
   // Confirm phase: create playlist with selected tracks
