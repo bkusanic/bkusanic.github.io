@@ -69,7 +69,6 @@ async function sPost(path,body,token){
 const GROQ_MODELS=[
   "llama-3.3-70b-versatile",
   "meta-llama/llama-4-scout-17b-16e-instruct",
-  "llama3-70b-8192",
   "llama-3.1-8b-instant",
 ];
 async function groqRaw(apiKey,message,maxTokens=2000){
@@ -82,19 +81,14 @@ async function groqRaw(apiKey,message,maxTokens=2000){
       });
       const d=await res.json();
       if(d.error){
-        // If model not found, try next one
-        if(d.error.code==="model_not_found"||d.error.message?.includes("does not exist")){
-          lastError=`${model} not available`;
-          continue;
-        }
-        throw new Error("Groq: "+(d.error.message||JSON.stringify(d.error)));
+        // Any model error → try next one
+        lastError=`${model}: ${d.error.message||JSON.stringify(d.error)}`;
+        continue;
       }
       return d.choices?.[0]?.message?.content||"";
     }catch(e){
-      if(e.message?.includes("does not exist")||e.message?.includes("not available")){
-        lastError=e.message; continue;
-      }
-      throw e;
+      lastError=`${model}: ${e.message}`;
+      continue;
     }
   }
   throw new Error("No Groq model available. Check your API key at console.groq.com. Last error: "+lastError);
